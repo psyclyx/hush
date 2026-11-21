@@ -25,6 +25,7 @@ buildGoModule {
 
   meta = {
     description = "Signal soft-block daemon: archive, hide, and auto-answer messages from paused conversations";
+    license = lib.licenses.gpl3Only;
     mainProgram = "hush";
     platforms = lib.platforms.linux;
   };

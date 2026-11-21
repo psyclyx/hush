@@ -117,3 +117,7 @@ to `settings` reload hush via SIGHUP, with no restart.
 `nix-shell -A shell` (or direnv), then `go test ./...`. The signal-cli patch
 is built against nixpkgs' signal-cli (`nix-build -A packages.signal-cli-hush`);
 it applies cleanly to 0.14.6 and 0.14.9.
+
+## License
+
+GPL-3.0-only (see LICENSE). The signal-cli patch is under signal-cli's GPL-3.0.
