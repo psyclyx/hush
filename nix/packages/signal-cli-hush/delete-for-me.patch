@@ -1,0 +1,187 @@
+diff --git a/lib/src/main/java/org/asamk/signal/manager/Manager.java b/lib/src/main/java/org/asamk/signal/manager/Manager.java
+index 82d42ed..255c411 100644
+--- a/lib/src/main/java/org/asamk/signal/manager/Manager.java
++++ b/lib/src/main/java/org/asamk/signal/manager/Manager.java
+@@ -250,6 +250,22 @@ public interface Manager extends Closeable {
+             Set<RecipientIdentifier> recipients
+     ) throws IOException, NotAGroupMemberException, GroupNotFoundException, GroupSendingNotAllowedException;
+ 
++    /**
++     * Tell this account's other devices to delete messages locally ("delete for me").
++     * Nothing is sent to the conversation's other participants.
++     *
++     * @param conversation   the 1:1 recipient, group, or note-to-self holding the messages
++     * @param author         who sent the messages
++     * @param sentTimestamps the messages' sent timestamps
++     */
++    default void sendDeleteForMe(
++            RecipientIdentifier conversation,
++            RecipientIdentifier.Single author,
++            List<Long> sentTimestamps
++    ) throws IOException, UnregisteredRecipientException {
++        throw new UnsupportedOperationException("deleteForMe is not supported by this manager");
++    }
++
+     SendMessageResults sendMessageReaction(
+             String emoji,
+             boolean remove,
+diff --git a/lib/src/main/java/org/asamk/signal/manager/internal/ManagerImpl.java b/lib/src/main/java/org/asamk/signal/manager/internal/ManagerImpl.java
+index 2026c52..82dd52b 100644
+--- a/lib/src/main/java/org/asamk/signal/manager/internal/ManagerImpl.java
++++ b/lib/src/main/java/org/asamk/signal/manager/internal/ManagerImpl.java
+@@ -1062,6 +1062,52 @@ public class ManagerImpl implements Manager {
+         return mentions;
+     }
+ 
++    @Override
++    public void sendDeleteForMe(
++            final RecipientIdentifier conversation,
++            final RecipientIdentifier.Single author,
++            final List<Long> sentTimestamps
++    ) throws IOException, UnregisteredRecipientException {
++        if (!account.isMultiDevice()) {
++            logger.debug("Not sending delete-for-me sync message because there are no linked devices.");
++            return;
++        }
++        final var conversationId = new org.whispersystems.signalservice.internal.push.ConversationIdentifier.Builder();
++        switch (conversation) {
++            case RecipientIdentifier.Group(var groupId) ->
++                    conversationId.threadGroupId(okio.ByteString.of(groupId.serialize()));
++            case RecipientIdentifier.Single single -> conversationId.threadServiceId(resolveServiceIdString(single));
++            case RecipientIdentifier.NoteToSelf ignored ->
++                    conversationId.threadServiceId(account.getAci().toString());
++        }
++        final var authorServiceId = resolveServiceIdString(author);
++        final var messages = sentTimestamps.stream()
++                .map(ts -> new org.whispersystems.signalservice.internal.push.AddressableMessage.Builder().authorServiceId(
++                        authorServiceId).sentTimestamp(ts).build())
++                .toList();
++        final var messageDeletes = new org.whispersystems.signalservice.internal.push.SyncMessage.DeleteForMe.MessageDeletes.Builder().conversation(
++                conversationId.build()).messages(messages).build();
++        final var deleteForMe = new org.whispersystems.signalservice.internal.push.SyncMessage.DeleteForMe.Builder().messageDeletes(
++                List.of(messageDeletes)).build();
++        final var syncMessage = new org.whispersystems.signalservice.internal.push.SyncMessage.Builder().deleteForMe(
++                deleteForMe).build();
++        final var content = new org.whispersystems.signalservice.internal.push.Content.Builder().syncMessage(
++                syncMessage).build();
++        try {
++            dependencies.getMessageSender().sendSyncMessage(content, false, Optional.empty());
++        } catch (org.whispersystems.signalservice.api.crypto.UntrustedIdentityException | org.signal.libsignal.protocol.NoSessionException e) {
++            throw new IOException("Failed to send delete-for-me sync message: " + e.getMessage(), e);
++        }
++    }
++
++    private String resolveServiceIdString(final RecipientIdentifier.Single single) throws IOException, UnregisteredRecipientException {
++        final var recipientId = context.getRecipientHelper().resolveRecipient(single);
++        final var address = account.getRecipientAddressResolver().resolveRecipientAddress(recipientId);
++        return address.serviceId()
++                .orElseThrow(() -> new IOException("No service id known for " + single.getIdentifier()))
++                .toString();
++    }
++
+     @Override
+     public SendMessageResults sendRemoteDeleteMessage(
+             long targetSentTimestamp,
+diff --git a/src/main/java/org/asamk/signal/commands/Commands.java b/src/main/java/org/asamk/signal/commands/Commands.java
+index a57c8c9..766a5ee 100644
+--- a/src/main/java/org/asamk/signal/commands/Commands.java
++++ b/src/main/java/org/asamk/signal/commands/Commands.java
+@@ -40,6 +40,7 @@ public class Commands {
+         addCommand(new RemoveContactCommand());
+         addCommand(new RemoveDeviceCommand());
+         addCommand(new RemovePinCommand());
++        addCommand(new DeleteForMeCommand());
+         addCommand(new RemoteDeleteCommand());
+         addCommand(new SendAdminDeleteCommand());
+         addCommand(new SendCommand());
+diff --git a/src/main/java/org/asamk/signal/commands/DeleteForMeCommand.java b/src/main/java/org/asamk/signal/commands/DeleteForMeCommand.java
+new file mode 100644
+index 0000000..257a7d1
+--- /dev/null
++++ b/src/main/java/org/asamk/signal/commands/DeleteForMeCommand.java
+@@ -0,0 +1,85 @@
++package org.asamk.signal.commands;
++
++import net.sourceforge.argparse4j.impl.Arguments;
++import net.sourceforge.argparse4j.inf.Namespace;
++import net.sourceforge.argparse4j.inf.Subparser;
++
++import org.asamk.signal.commands.exceptions.CommandException;
++import org.asamk.signal.commands.exceptions.UnexpectedErrorException;
++import org.asamk.signal.commands.exceptions.UserErrorException;
++import org.asamk.signal.manager.Manager;
++import org.asamk.signal.manager.api.RecipientIdentifier;
++import org.asamk.signal.manager.api.UnregisteredRecipientException;
++import org.asamk.signal.output.OutputWriter;
++import org.asamk.signal.util.CommandUtil;
++
++import java.io.IOException;
++
++public class DeleteForMeCommand implements JsonRpcLocalCommand {
++
++    @Override
++    public String getName() {
++        return "deleteForMe";
++    }
++
++    @Override
++    public void attachToSubparser(final Subparser subparser) {
++        subparser.help("Delete messages from this account's other devices only (\"delete for me\").");
++        subparser.addArgument("-a", "--target-author")
++                .required(true)
++                .help("Specify the number or uuid of the messages' author.");
++        subparser.addArgument("-t", "--target-timestamp")
++                .required(true)
++                .type(long.class)
++                .nargs("+")
++                .help("Specify the sent timestamps of the messages to delete.");
++        final var conversation = subparser.addMutuallyExclusiveGroup().required(true);
++        conversation.addArgument("-g", "--group-id", "--group").help("Specify the conversation's group ID.");
++        conversation.addArgument("-r", "--recipient").help("Specify the 1:1 conversation's number or uuid.");
++        conversation.addArgument("--note-to-self").action(Arguments.storeTrue());
++    }
++
++    @Override
++    public void handleCommand(
++            final Namespace ns,
++            final Manager m,
++            final OutputWriter outputWriter
++    ) throws CommandException {
++        final var localNumber = m.getSelfNumber();
++        final RecipientIdentifier conversation;
++        final var groupId = ns.getString("group-id");
++        final var recipient = ns.getString("recipient");
++        if (groupId != null) {
++            conversation = new RecipientIdentifier.Group(CommandUtil.getGroupId(groupId));
++        } else if (recipient != null) {
++            conversation = CommandUtil.getSingleRecipientIdentifier(recipient, localNumber);
++        } else if (Boolean.TRUE.equals(ns.getBoolean("note-to-self"))) {
++            conversation = new RecipientIdentifier.NoteToSelf();
++        } else {
++            // JSON-RPC bypasses argparse, so the required group isn't enforced there.
++            throw new UserErrorException("One of group-id, recipient or note-to-self is required");
++        }
++        final var authorString = ns.getString("target-author");
++        if (authorString == null) {
++            throw new UserErrorException("Missing target-author");
++        }
++        final var author = CommandUtil.getSingleRecipientIdentifier(authorString, localNumber);
++        final var rawTimestamps = ns.<Object>getList("target-timestamp");
++        if (rawTimestamps == null || rawTimestamps.isEmpty()) {
++            throw new UserErrorException("Missing target-timestamp");
++        }
++        // JSON-RPC numbers may arrive as Integer or Long.
++        final var timestamps = rawTimestamps.stream().map(t -> ((Number) t).longValue()).toList();
++
++        try {
++            m.sendDeleteForMe(conversation, author, timestamps);
++        } catch (UnregisteredRecipientException e) {
++            throw new UserErrorException("The user " + e.getSender().getIdentifier() + " is not registered.");
++        } catch (UnsupportedOperationException e) {
++            throw new UserErrorException(e.getMessage());
++        } catch (IOException e) {
++            throw new UnexpectedErrorException("Failed to send delete-for-me: " + e.getMessage() + " (" + e.getClass()
++                    .getSimpleName() + ")", e);
++        }
++    }
++}
